@@ -1,0 +1,50 @@
+# sum.ys - 迭代求和链表元素
+# 姓名: [天天去图书馆看美女], 学号: [23401090109]
+# 功能: 迭代地求和链表元素
+
+    .pos 0
+    irmovq Stack, %rsp      # 初始化栈指针
+    call Main               # 调用主函数
+    halt                    # 停止程序
+
+# 主函数
+Main:
+    irmovq ele1, %rdi
+    call sum_list
+    ret
+
+# sum_list函数 - 迭代地求和链表
+# %rdi = 当前节点指针
+# %rax = 累加和 val
+sum_list:
+    #初始化
+    irmovq $0, %rax
+    andq %rdi, %rdi
+    je Done
+
+Loop:
+    #循环体
+    mrmovq (%rdi), %r10     #累加
+    addq %r10, %rax         
+    mrmovq 8(%rdi), rdi     #指向下一个指针
+    andq %rdi, %rdi
+    jne Loop
+    
+Done:
+    ret
+
+# 链表数据
+.align 8
+ele1:
+    .quad 0x00a            # 值 = 0x00a (十进制10)
+    .quad ele2             # 下一个指针指向ele2
+ele2:
+    .quad 0x0b0            # 值 = 0x0b0 (十进制176)
+    .quad ele3             # 下一个指针指向ele3  
+ele3:
+    .quad 0xc00            # 值 = 0xc00 (十进制3072)
+    .quad 0                # 下一个指针为NULL（链表结束）
+
+# 栈空间
+.pos 0x200
+Stack:
