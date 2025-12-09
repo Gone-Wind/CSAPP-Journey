@@ -1,0 +1,31 @@
+
+level4 和 leve5 增加了防御措施, 随机化 和 堆栈内部代码无法执行 -> 可通过面向返回编程解决ROP
+    
+level4:
+
+    还是可以通过getbuf输入字符串修改原栈的内容
+
+    可通过现有代码块 gadget -> 构建level2所需的代码块 -> 解决无法注入恶意代码
+
+    level2所需执行代码块为:
+        movq  $0x59b997fa,%rdi
+        pushq $0x4017ec
+        ret
+    利用gadget构建同等效果代码块为:
+        1.popq %rax (ret)
+        2.movq %rax, %rdi (ret)
+        ret
+        
+        [1.address]
+        [ cookies ]
+        [2.address]
+        [t2.address]
+
+level5:
+    传递字符串cookies,要考虑栈随机化的影响 -> 无法实现像level3一样直接将 *cookies的绝对地址 传入 %rdi
+                                                    (movq $0x59b997fa, %rdi)
+    
+    可通过相对地址的计算来解决
+
+栈随机化:
+    程序运行时,栈的起始地址发生变化

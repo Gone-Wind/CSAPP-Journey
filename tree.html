@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎄 手势控制3D圣诞树</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; }
+        canvas { display: block; }
+        #info {
+            position: absolute; top: 10px; left: 10px; color: #fff; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            z-index: 10; padding: 10px; background: rgba(0, 0, 0, 0.6); border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+            transition: opacity 0.3s;
+        }
+        #info:hover { opacity: 0.8; }
+        #upload-container {
+            position: absolute; bottom: 10px; right: 10px; z-index: 10;
+        }
+        .file-input {
+            padding: 10px 15px; border: none; background-color: #A52A2A; color: white;
+            cursor: pointer; border-radius: 5px; font-weight: bold;
+            transition: background-color 0.3s;
+        }
+        .file-input:hover { background-color: #C0392B; }
+        .input_video { display: none; } /* 隐藏 MediaPipe 视频流 */
+    </style>
+</head>
+<body>
+    <div id="info">
+        <h3>🌟 圣诞树手势控制</h3>
+        当前状态: <span id="current-state" style="color: #FFD700;">合拢态 (CONE)</span><br>
+        <p style="font-size: 0.9em; margin-top: 5px;">
+        **手势指令:**
+        <ul>
+            <li>**握拳 (Closed Fist):** → **合拢态** (圣诞树形状)</li>
+            <li>**五指打开 (Open Palm):** → **散开态** (照片/装饰物漂浮)</li>
+            <li>**抓取 (Pinch/Grab):** → **照片放大态** (散开态下选中最近照片)</li>
+            <li>**手移动/旋转:** → 旋转场景/调整相机</li>
+        </ul>
+        </p>
+    </div>
+    <div id="upload-container">
+        <label for="photo-upload" class="file-input">⬆️ 上传圣诞照片 (JPG/PNG)</label>
+        <input type="file" id="photo-upload" accept="image/*" multiple style="display: none;">
+    </div>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675466854/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tweenjs/tween.js@18.6.4/dist/tween.umd.js"></script>
+
+    <script>
+        // --- 1. 全局变量和初始化 ---
+
+        const NUM_INSTANCES = 6000; // 装饰物数量
+        const PHOTO_COUNT_MAX = 20; // 最大照片数量
+        const photoMeshes = []; // 存储照片 Mesh
+        let currentPhotoFocus = null; // 当前放大的照片
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 50;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        // 主色系：哑光绿、金属金、圣诞红
+        const COLORS = {
+            GREEN: 0x225522, // 哑光绿
+            GOLD: 0xFFD700,  // 金属金
+            RED: 0xA52A2A,   // 圣诞红
+            PARTICLE: 0xCCCCCC // 粒子颜色
+        };
+
+        // 后处理 - 实现电影感的辉光 (UnrealBloomPass)
+        const composer = new THREE.EffectComposer(renderer);
+        const renderPass = new THREE.RenderPass(scene, camera);
+        composer.addPass(renderPass);
+
+        const bloomPass = new THREE.UnrealBloomPass(
+            new THREE.Vector2(window.innerWidth, window.innerHeight),
+            1.8, // 强度 Strength (增强电影感)
+            0.5, // 半径 Radius
+            0.95 // 阈值 Threshold (只让最亮的物体发光)
+        );
+        composer.addPass(bloomPass);
+
+        const instancedMeshes = [];
+        const dummy = new THREE.Object3D();
+        const originalPositions = []; // 初始合拢态位置
+        const scatteredPositions = []; // 散开态位置
+
+        let currentState = 'CONE'; // CONE, CLOUD, FOCUS
+        const stateDisplay = document.getElementById('current-state');
+
+        // 光照
+        scene.add(new THREE.AmbientLight(0x404040, 3));
+        const pointLight = new THREE.PointLight(COLORS.GOLD, 10, 100);
+        pointLight.position.set(0, 15, 0);
+        scene.add(pointLight);
+
+        // 窗口调整
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+
+        // --- 2. 圣诞树几何体生成 (InstancedMesh) ---
+
+        function createDecorations() {
+            // 几何体：球、正方体、糖果棍
+            const sphereGeometry = new THREE.SphereGeometry(0.5, 8, 8);
+            const boxGeometry = new THREE.BoxGeometry(0.8, 0.8, 0.8);
+            const candyGeometry = new THREE.CylinderGeometry(0.2, 0.2, 3, 8);
+
+            const geometries = [sphereGeometry, boxGeometry, candyGeometry];
+            const materials = [
+                new THREE.MeshStandardMaterial({ color: COLORS.GOLD, metalness: 1.0, roughness: 0.05 }), // 金属金，高光
+                new THREE.MeshStandardMaterial({ color: COLORS.RED, metalness: 0.8, roughness: 0.2 }), // 圣诞红
+                new THREE.MeshStandardMaterial({ color: COLORS.GREEN, metalness: 0.5, roughness: 0.5 })
+            ];
+
+            for (let i = 0; i < 3; i++) {
+                const mesh = new THREE.InstancedMesh(geometries[i], materials[i], NUM_INSTANCES / 3);
+                instancedMeshes.push(mesh);
+                scene.add(mesh);
+            }
+
+            // 设置初始位置 (合拢态：圆锥体) 和目标位置 (散开态：随机云)
+            for (let i = 0; i < NUM_INSTANCES; i++) {
+                // 合拢态 (圆锥体形状)
+                const h = (i / NUM_INSTANCES) * 30; // 高度 0 到 30
+                const r = (30 - h) * 0.3; // 锥体半径
+                const angle = Math.random() * Math.PI * 2;
+                const x = r * Math.cos(angle);
+                const z = r * Math.sin(angle);
+                const y = h - 15; // 居中
+
+                originalPositions.push(new THREE.Vector3(x, y, z));
+
+                // 散开态 (随机云)
+                scatteredPositions.push(new THREE.Vector3(
+                    (Math.random() - 0.5) * 100,
+                    (Math.random() - 0.5) * 100,
+                    (Math.random() - 0.5) * 100
+                ));
+            }
+
+            // 初始化 InstancedMesh 位置到合拢态
+            let instanceIndex = 0;
+            instancedMeshes.forEach(mesh => {
+                for (let i = 0; i < mesh.count; i++) {
+                    dummy.position.copy(originalPositions[instanceIndex]);
+                    dummy.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+                    dummy.scale.setScalar(0.5 + Math.random() * 0.5);
+                    dummy.updateMatrix();
+                    mesh.setMatrixAt(i, dummy.matrix);
+                    instanceIndex++;
+                }
+                mesh.instanceMatrix.needsUpdate = true;
+            });
+        }
+
+
+        // --- 3. 照片云处理 ---
+
+        const textureLoader = new THREE.TextureLoader();
+        const photoUpload = document.getElementById('photo-upload');
+
+        photoUpload.addEventListener('change', (event) => {
+            const files = event.target.files;
+            Array.from(files).forEach((file, index) => {
+                if (photoMeshes.length >= PHOTO_COUNT_MAX) return;
+
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const texture = textureLoader.load(e.target.result);
+                    createPhotoMesh(texture);
+                };
+                reader.readAsDataURL(file);
+            });
+        });
+
+        function createPhotoMesh(texture) {
+            // 使用 PlaneGeometry 创建照片网格
+            const geometry = new THREE.PlaneGeometry(8, 8); // 照片尺寸
+            const material = new THREE.MeshBasicMaterial({
+                map: texture,
+                side: THREE.DoubleSide,
+                transparent: true,
+                opacity: 0.9,
+                depthWrite: false // 避免深度冲突
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+
+            // 设置照片在合拢态和散开态的位置
+            const targetScatterPos = new THREE.Vector3(
+                (Math.random() - 0.5) * 80,
+                (Math.random() - 0.5) * 80,
+                (Math.random() - 0.5) * 80
+            );
+
+            // 将照片初始设置到合拢态位置附近的随机点 (在树的圆锥体附近)
+            const initialConePos = originalPositions[Math.floor(Math.random() * NUM_INSTANCES)].clone().add(new THREE.Vector3(
+                Math.random() - 0.5,
+                Math.random() - 0.5,
+                Math.random() - 0.5
+            ));
+
+            mesh.userData = {
+                initialPosition: initialConePos,
+                scatteredPosition: targetScatterPos,
+                isFocused: false
+            };
+
+            mesh.position.copy(initialConePos);
+            mesh.lookAt(camera.position);
+            photoMeshes.push(mesh);
+            scene.add(mesh);
+
+            // 将照片散开位置加入到总散开位置列表
+            scatteredPositions.push(targetScatterPos);
+        }
+
+        // --- 4. 状态切换与过渡动画 (TWEEN) ---
+
+        function updateStateDisplay(newState) {
+             const map = {
+                'CONE': '合拢态 (CONE)',
+                'CLOUD': '散开态 (CLOUD)',
+                'FOCUS': '照片放大态 (FOCUS)'
+            };
+            stateDisplay.textContent = map[newState] || newState;
+            stateDisplay.style.color = newState === 'FOCUS' ? '#A52A2A' : (newState === 'CLOUD' ? '#9FEF00' : '#FFD700');
+        }
+
+        function transitionState(newState) {
+            if (currentState === newState) return;
+            
+            currentState = newState;
+            updateStateDisplay(newState);
+
+            TWEEN.removeAll(); 
+
+            let instanceIndex = 0;
+            // 装饰物过渡
+            instancedMeshes.forEach(mesh => {
+                for (let i = 0; i < mesh.count; i++) {
+                    const targetPos = newState === 'CONE' ? originalPositions[instanceIndex] : scatteredPositions[instanceIndex];
+                    const currentMatrix = new THREE.Matrix4();
+                    mesh.getMatrixAt(i, currentMatrix);
+                    const currentPos = new THREE.Vector3().setFromMatrixPosition(currentMatrix);
+
+                    new TWEEN.Tween(currentPos)
+                        .to(targetPos, 1800)
+                        .easing(TWEEN.Easing.Quadratic.InOut)
+                        .onUpdate(() => {
+                            dummy.position.copy(currentPos);
+                            // 保持旋转和缩放
+                            dummy.rotation.setFromRotationMatrix(currentMatrix);
+                            dummy.scale.setFromMatrixScale(currentMatrix);
+                            dummy.updateMatrix();
+                            mesh.setMatrixAt(i, dummy.matrix);
+                            mesh.instanceMatrix.needsUpdate = true;
+                        })
+                        .start();
+
+                    instanceIndex++;
+                }
+            });
+
+            // 照片过渡
+            photoMeshes.forEach((mesh, photoIndex) => {
+                const scatterIndex = NUM_INSTANCES + photoIndex;
+                const targetPos = newState === 'CONE' ? mesh.userData.initialPosition : scatteredPositions[scatterIndex];
+
+                if (newState !== 'FOCUS' || mesh !== currentPhotoFocus) {
+                    new TWEEN.Tween(mesh.position)
+                        .to(targetPos, 1800)
+                        .easing(TWEEN.Easing.Quadratic.InOut)
+                        .start();
+                    new TWEEN.Tween(mesh.rotation)
+                        .to({ x: 0, y: 0, z: 0 }, 1800) // 退出FOCUS时重置旋转
+                        .easing(TWEEN.Easing.Quadratic.InOut)
+                        .start();
+                }
+            });
+
+            // 相机和焦点逻辑
+            if (newState !== 'FOCUS') {
+                currentPhotoFocus = null;
+                // 恢复默认相机位置
+                new TWEEN.Tween(camera.position).to({ x: 0, y: 0, z: 50 }, 1800).easing(TWEEN.Easing.Quadratic.InOut).start();
+                new TWEEN.Tween(scene.rotation).to({ x: 0, y: 0, z: 0 }, 1800).easing(TWEEN.Easing.Quadratic.InOut).start();
+            }
+        }
+
+        function focusOnPhoto(mesh) {
+            if (currentState === 'FOCUS' && currentPhotoFocus === mesh) return;
+            if (currentState === 'CONE') return; // 合拢态不能放大照片
+
+            currentPhotoFocus = mesh;
+            transitionState('FOCUS');
+
+            // 目标相机位置：照片前方12个单位
+            const targetCameraPos = mesh.position.clone().add(new THREE.Vector3(0, 0, 12));
+            
+            // 相机平滑移动
+            new TWEEN.Tween(camera.position)
+                .to(targetCameraPos, 1500)
+                .easing(TWEEN.Easing.Quadratic.InOut)
+                .start();
+
+            // 照片自身旋转动画，使其面向相机
+            new TWEEN.Tween(mesh.rotation)
+                .to({ x: 0, y: 0, z: 0 }, 1500)
+                .easing(TWEEN.Easing.Quadratic.InOut)
+                .start();
+        }
+
+        // --- 5. MediaPipe Hands 整合 ---
+
+        const videoElement = document.createElement('video');
+        videoElement.classList.add('input_video');
+        document.body.appendChild(videoElement);
+
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675466854/${file}`
+        });
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+
+        hands.onResults(onResults);
+
+        const cameraMP = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({ image: videoElement });
+            },
+            width: 1280,
+            height: 720
+        });
+        cameraMP.start();
+
+        let lastHandPose = 'Unknown';
+        let rotationDeltaX = 0;
+        let rotationDeltaY = 0;
+        let lastHandX = null;
+        let lastHandY = null;
+
+        function onResults(results) {
+            if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+                lastHandPose = 'Unknown';
+                lastHandX = null;
+                lastHandY = null;
+                return;
+            }
+
+            const landmarks = results.multiHandLandmarks[0];
+            const fingerTips = [
+                landmarks[4], landmarks[8], landmarks[12], landmarks[16], landmarks[20]
+            ];
+            const palmBase = landmarks[0];
+
+            // --- 手势识别逻辑 ---
+            const tipDistanceThreshold = 0.15; // 指尖到掌根的距离阈值 (握拳)
+            const openDistanceThreshold = 0.25; // 张开的距离阈值 (张开)
+            const pinchThreshold = 0.05; // 捏合阈值
+
+            const isClosedFist = fingerTips.every(tip => {
+                return Math.hypot(tip.x - palmBase.x, tip.y - palmBase.y) < tipDistanceThreshold;
+            });
+
+            const isOpenPalm = fingerTips.every(tip => {
+                return Math.hypot(tip.x - palmBase.x, tip.y - palmBase.y) > openDistanceThreshold;
+            });
+
+            const indexTip = landmarks[8];
+            const thumbTip = landmarks[4];
+            const isPinching = Math.hypot(indexTip.x - thumbTip.x, indexTip.y - thumbTip.y) < pinchThreshold;
+
+            let currentPose = 'Unknown';
+            if (isClosedFist) {
+                currentPose = 'Closed_Fist';
+            } else if (isOpenPalm) {
+                currentPose = 'Open_Palm';
+            } else if (isPinching) {
+                currentPose = 'Pinch_Grab';
+            }
+
+            // --- 状态切换逻辑 (只在手势变化时触发，避免过度切换) ---
+            if (currentPose !== lastHandPose && currentPose !== 'Unknown') {
+                if (currentPose === 'Closed_Fist') {
+                    transitionState('CONE');
+                } else if (currentPose === 'Open_Palm') {
+                    transitionState('CLOUD');
+                } else if (currentPose === 'Pinch_Grab' && currentState === 'CLOUD' && photoMeshes.length > 0) {
+                    // 抓取逻辑：在散开态下，选择最近的照片进行放大
+                    const normalizedX = palmBase.x * 2 - 1; // 转换为 -1 到 1
+                    const normalizedY = - (palmBase.y * 2 - 1); // 转换为 -1 到 1
+
+                    const raycaster = new THREE.Raycaster();
+                    const pointer = new THREE.Vector2(normalizedX, normalizedY);
+                    raycaster.setFromCamera(pointer, camera);
+
+                    const intersects = raycaster.intersectObjects(photoMeshes);
+                    if (intersects.length > 0) {
+                        focusOnPhoto(intersects[0].object);
+                    }
+                }
+            }
+
+            // --- 旋转控制逻辑 (手旋转) ---
+            if (currentState === 'CLOUD' || currentState === 'FOCUS') {
+                const handX = palmBase.x; // 0.0 to 1.0
+                const handY = palmBase.y; // 0.0 to 1.0
+
+                if (lastHandX !== null && lastHandY !== null) {
+                    // 计算手部移动作为旋转增量 (映射到场景旋转)
+                    // 移动因子 0.05 调整旋转速度
+                    rotationDeltaY += (handX - lastHandX) * 0.05; // 水平移动影响 Y 轴旋转
+                    rotationDeltaX += (handY - lastHandY) * 0.05; // 垂直移动影响 X 轴旋转
+                }
+                lastHandX = handX;
+                lastHandY = handY;
+            } else {
+                lastHandX = null;
+                lastHandY = null;
+            }
+
+            lastHandPose = currentPose;
+        }
+
+        // --- 6. 动画循环 ---
+        function animate(time) {
+            requestAnimationFrame(animate);
+
+            TWEEN.update(time);
+
+            // 场景旋转 (手势控制)
+            if (currentState === 'CLOUD' || currentState === 'FOCUS') {
+                // 应用旋转增量
+                scene.rotation.y += rotationDeltaY;
+                scene.rotation.x += rotationDeltaX;
+                // 缓慢减速，实现惯性效果
+                rotationDeltaY *= 0.85;
+                rotationDeltaX *= 0.85;
+            } else {
+                // 合拢态下的默认缓慢旋转
+                scene.rotation.y += 0.001;
+            }
+            
+            // 如果处于照片放大态，确保相机一直面向照片
+            if (currentState === 'FOCUS' && currentPhotoFocus) {
+                camera.lookAt(currentPhotoFocus.position);
+            }
+            
+            // 照片在散开态下自转
+            if (currentState === 'CLOUD') {
+                photoMeshes.forEach(mesh => {
+                    mesh.rotation.y += 0.005;
+                    mesh.rotation.x += 0.002;
+                });
+            }
+
+
+            // 使用 Composer 渲染带有辉光效果的场景
+            composer.render();
+        }
+
+        // 启动应用
+        createDecorations();
+        animate();
+    </script>
+</body>
+</html>
